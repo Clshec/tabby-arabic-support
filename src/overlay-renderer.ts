@@ -25,13 +25,24 @@ function palette256(index: number): string {
   return `rgb(${gray},${gray},${gray})`;
 }
 
+interface LineCacheEntry {
+  rawText: string;
+  cursorX: number;
+  topPx: number;
+  el: HTMLElement;
+}
+
 export class ArabicOverlayRenderer {
   private overlayContainer: HTMLElement | null = null;
   private disposables: (() => void)[] = [];
   private animationFrameId: number | null = null;
+  private isRenderScheduled = false;
   private isDestroyed = false;
   private alternateScreenActive = false;
   private options: OverlayOptions = { enabled: true, mode: 'auto' };
+
+  // Cache rendered DOM lines to prevent layout thrashing and GC pauses
+  private lineCache = new Map<number, LineCacheEntry>();
 
   constructor(
     private xterm: any,
@@ -42,11 +53,13 @@ export class ArabicOverlayRenderer {
 
   setOptions(options: Partial<OverlayOptions>): void {
     this.options = { ...this.options, ...options };
+    this.clearAll();
     this.scheduleRender();
   }
 
   setAlternateScreen(active: boolean): void {
     this.alternateScreenActive = active;
+    this.clearAll();
     this.scheduleRender();
   }
 
@@ -73,6 +86,7 @@ export class ArabicOverlayRenderer {
       if (this.overlayContainer && this.overlayContainer.parentElement) {
         this.overlayContainer.parentElement.removeChild(this.overlayContainer);
       }
+      this.lineCache.clear();
 
       const overlay = document.createElement('div');
       overlay.className = 'tabby-arabic-overlay';
@@ -102,6 +116,7 @@ export class ArabicOverlayRenderer {
           position: absolute;
           left: 0;
           right: 0;
+          width: 100%;
           white-space: pre;
           direction: ltr;
           unicode-bidi: embed;
@@ -134,16 +149,18 @@ export class ArabicOverlayRenderer {
   private bindXtermEvents(): void {
     if (!this.xterm) return;
 
+    // Only subscribe to core render & layout events to avoid event floods
     const events = [
       this.xterm.onRender?.(() => this.scheduleRender()),
-      this.xterm.onCursorMove?.(() => this.scheduleRender()),
-      this.xterm.onScroll?.(() => this.scheduleRender()),
-      this.xterm.onResize?.(() => this.scheduleRender()),
+      this.xterm.onScroll?.(() => {
+        this.clearAll();
+        this.scheduleRender();
+      }),
+      this.xterm.onResize?.(() => {
+        this.clearAll();
+        this.scheduleRender();
+      }),
       this.xterm.onSelectionChange?.(() => this.scheduleRender()),
-      this.xterm.onLineFeed?.(() => this.scheduleRender()),
-      this.xterm.onWriteParsed?.(() => this.scheduleRender()),
-      this.xterm.onData?.(() => this.scheduleRender()),
-      this.xterm.onKey?.(() => this.scheduleRender()),
     ];
 
     for (const ev of events) {
@@ -154,20 +171,22 @@ export class ArabicOverlayRenderer {
   }
 
   scheduleRender(): void {
-    if (this.isDestroyed) return;
-    if (this.animationFrameId) {
-      cancelAnimationFrame(this.animationFrameId);
-    }
+    if (this.isDestroyed || this.isRenderScheduled) return;
+
+    this.isRenderScheduled = true;
     this.animationFrameId = requestAnimationFrame(() => {
+      this.isRenderScheduled = false;
       this.render();
     });
   }
 
-  private clearOverlay(): void {
-    if (!this.overlayContainer) return;
-    while (this.overlayContainer.firstChild) {
-      this.overlayContainer.removeChild(this.overlayContainer.firstChild);
+  private clearAll(): void {
+    if (this.overlayContainer) {
+      while (this.overlayContainer.firstChild) {
+        this.overlayContainer.removeChild(this.overlayContainer.firstChild);
+      }
     }
+    this.lineCache.clear();
   }
 
   private getCellDims() {
@@ -226,7 +245,7 @@ export class ArabicOverlayRenderer {
     if (this.isDestroyed || !this.xterm) return;
 
     if (!this.options.enabled || this.options.mode === 'off') {
-      this.clearOverlay();
+      this.clearAll();
       return;
     }
 
@@ -246,87 +265,157 @@ export class ArabicOverlayRenderer {
       ? `${configuredFont}, 'Cascadia Mono', 'Cascadia Code', 'Consolas', 'Segoe UI', monospace`
       : `'Cascadia Mono', 'Cascadia Code', 'Consolas', 'Segoe UI', monospace`;
 
-    this.clearOverlay();
+    const activeRows = new Set<number>();
 
     for (let y = 0; y < rows; y++) {
       const bufLine = buf.getLine(viewportY + y);
-      if (!bufLine) continue;
-
-      const trimmedStr = bufLine.translateToString(true);
-      if (!trimmedStr || !containsRTL(trimmedStr)) {
+      if (!bufLine) {
+        this.removeCachedLine(y);
         continue;
       }
 
-      // Create overlay line div
-      const lineDiv = document.createElement('div');
-      lineDiv.className = 'arabic-line';
-      lineDiv.style.top = `${dims.canvasTop + y * dims.cellH}px`;
-      lineDiv.style.height = `${dims.cellH}px`;
-      lineDiv.style.lineHeight = `${dims.cellH}px`;
-      lineDiv.style.fontSize = fontSize;
-      lineDiv.style.fontFamily = fontFamily;
-      lineDiv.style.backgroundColor = themeBg;
-
-      const lineLen = bufLine.length;
-      let currentSpan: HTMLSpanElement | null = null;
-      let currentKey = '';
-
-      for (let x = 0; x < lineLen; x++) {
-        const cell = bufLine.getCell(x);
-        if (!cell) continue;
-
-        const ch = cell.getChars();
-        const width = cell.getWidth();
-
-        if (width === 0) continue;
-
-        const fgColor = this.getCellColor(cell);
-        const bgColor = this.getCellBgColor(cell);
-
-        let bold = false;
-        let dim = false;
-        let italic = false;
-        let underline = false;
-
-        try {
-          bold = !!(cell.isBold && cell.isBold());
-          dim = !!(cell.isDim && cell.isDim());
-          italic = !!(cell.isItalic && cell.isItalic());
-          underline = !!(cell.isUnderline && cell.isUnderline());
-        } catch {
-          // ignore
-        }
-
-        const key = `${fgColor}|${bgColor || ''}|${bold ? 'b' : ''}${dim ? 'd' : ''}${italic ? 'i' : ''}${underline ? 'u' : ''}`;
-
-        if (key !== currentKey || !currentSpan) {
-          currentSpan = document.createElement('span');
-          currentSpan.style.color = fgColor;
-          if (bgColor) currentSpan.style.backgroundColor = bgColor;
-          if (bold) currentSpan.style.fontWeight = 'bold';
-          if (dim) currentSpan.style.opacity = '0.6';
-          if (italic) currentSpan.style.fontStyle = 'italic';
-          if (underline) currentSpan.style.textDecoration = 'underline';
-
-          lineDiv.appendChild(currentSpan);
-          currentKey = key;
-        }
-
-        currentSpan.textContent += ch || ' ';
+      const trimmedStr = bufLine.translateToString(true);
+      if (!trimmedStr || !containsRTL(trimmedStr)) {
+        this.removeCachedLine(y);
+        continue;
       }
 
-      // Draw cursor on this visible line
-      if (y === buf.cursorY) {
-        const cursorEl = document.createElement('span');
-        cursorEl.className = 'overlay-cursor';
-        cursorEl.style.left = `${dims.canvasLeft + buf.cursorX * dims.cellW}px`;
-        cursorEl.style.height = `${dims.cellH}px`;
-        cursorEl.style.color = this.xterm.options?.theme?.cursor || '#d4d4d4';
-        lineDiv.appendChild(cursorEl);
+      activeRows.add(y);
+      const isCursorRow = y === buf.cursorY;
+      const cursorX = isCursorRow ? buf.cursorX : -1;
+      const topPx = dims.canvasTop + y * dims.cellH;
+
+      // Check if line is already rendered identically in cache (Diffing)
+      const cached = this.lineCache.get(y);
+      if (
+        cached &&
+        cached.rawText === trimmedStr &&
+        cached.cursorX === cursorX &&
+        cached.topPx === topPx
+      ) {
+        // Line content and cursor have not changed — skip DOM manipulation entirely
+        continue;
       }
 
-      container.appendChild(lineDiv);
+      // Rebuild only this specific line
+      const lineDiv = this.buildLineElement(
+        bufLine,
+        dims,
+        topPx,
+        fontSize,
+        fontFamily,
+        themeBg,
+        cursorX
+      );
+
+      if (cached && cached.el.parentNode === container) {
+        container.replaceChild(lineDiv, cached.el);
+      } else {
+        container.appendChild(lineDiv);
+      }
+
+      this.lineCache.set(y, {
+        rawText: trimmedStr,
+        cursorX,
+        topPx,
+        el: lineDiv,
+      });
     }
+
+    // Clean up any stale rows that are no longer active
+    for (const cachedY of Array.from(this.lineCache.keys())) {
+      if (!activeRows.has(cachedY)) {
+        this.removeCachedLine(cachedY);
+      }
+    }
+  }
+
+  private removeCachedLine(y: number): void {
+    const entry = this.lineCache.get(y);
+    if (entry) {
+      if (entry.el.parentNode) {
+        entry.el.parentNode.removeChild(entry.el);
+      }
+      this.lineCache.delete(y);
+    }
+  }
+
+  private buildLineElement(
+    bufLine: any,
+    dims: any,
+    topPx: number,
+    fontSize: string,
+    fontFamily: string,
+    themeBg: string,
+    cursorX: number
+  ): HTMLElement {
+    const lineDiv = document.createElement('div');
+    lineDiv.className = 'arabic-line';
+    lineDiv.style.top = `${topPx}px`;
+    lineDiv.style.height = `${dims.cellH}px`;
+    lineDiv.style.lineHeight = `${dims.cellH}px`;
+    lineDiv.style.fontSize = fontSize;
+    lineDiv.style.fontFamily = fontFamily;
+    lineDiv.style.backgroundColor = themeBg;
+
+    const lineLen = bufLine.length;
+    let currentSpan: HTMLSpanElement | null = null;
+    let currentKey = '';
+
+    for (let x = 0; x < lineLen; x++) {
+      const cell = bufLine.getCell(x);
+      if (!cell) continue;
+
+      const ch = cell.getChars();
+      const width = cell.getWidth();
+      if (width === 0) continue;
+
+      const fgColor = this.getCellColor(cell);
+      const bgColor = this.getCellBgColor(cell);
+
+      let bold = false;
+      let dim = false;
+      let italic = false;
+      let underline = false;
+
+      try {
+        bold = !!(cell.isBold && cell.isBold());
+        dim = !!(cell.isDim && cell.isDim());
+        italic = !!(cell.isItalic && cell.isItalic());
+        underline = !!(cell.isUnderline && cell.isUnderline());
+      } catch {
+        // ignore
+      }
+
+      const key = `${fgColor}|${bgColor || ''}|${bold ? 'b' : ''}${dim ? 'd' : ''}${italic ? 'i' : ''}${underline ? 'u' : ''}`;
+
+      if (key !== currentKey || !currentSpan) {
+        currentSpan = document.createElement('span');
+        currentSpan.style.color = fgColor;
+        if (bgColor) currentSpan.style.backgroundColor = bgColor;
+        if (bold) currentSpan.style.fontWeight = 'bold';
+        if (dim) currentSpan.style.opacity = '0.6';
+        if (italic) currentSpan.style.fontStyle = 'italic';
+        if (underline) currentSpan.style.textDecoration = 'underline';
+
+        lineDiv.appendChild(currentSpan);
+        currentKey = key;
+      }
+
+      currentSpan.textContent += ch || ' ';
+    }
+
+    // Draw cursor if on this visible line
+    if (cursorX >= 0) {
+      const cursorEl = document.createElement('span');
+      cursorEl.className = 'overlay-cursor';
+      cursorEl.style.left = `${dims.canvasLeft + cursorX * dims.cellW}px`;
+      cursorEl.style.height = `${dims.cellH}px`;
+      cursorEl.style.color = this.xterm.options?.theme?.cursor || '#d4d4d4';
+      lineDiv.appendChild(cursorEl);
+    }
+
+    return lineDiv;
   }
 
   destroy(): void {
@@ -336,6 +425,7 @@ export class ArabicOverlayRenderer {
     }
     this.disposables.forEach((d) => d());
     this.disposables = [];
+    this.clearAll();
     if (this.overlayContainer && this.overlayContainer.parentNode) {
       this.overlayContainer.parentNode.removeChild(this.overlayContainer);
     }

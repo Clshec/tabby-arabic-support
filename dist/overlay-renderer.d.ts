@@ -8,9 +8,11 @@ export declare class ArabicOverlayRenderer {
     private overlayContainer;
     private disposables;
     private animationFrameId;
+    private isRenderScheduled;
     private isDestroyed;
     private alternateScreenActive;
     private options;
+    private lineCache;
     constructor(xterm: any, hostElement: HTMLElement);
     setOptions(options: Partial<OverlayOptions>): void;
     setAlternateScreen(active: boolean): void;
@@ -19,10 +21,12 @@ export declare class ArabicOverlayRenderer {
     private injectStyles;
     private bindXtermEvents;
     scheduleRender(): void;
-    private clearOverlay;
+    private clearAll;
     private getCellDims;
     private getCellColor;
     private getCellBgColor;
     private render;
+    private removeCachedLine;
+    private buildLineElement;
     destroy(): void;
 }
